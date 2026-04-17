@@ -11,7 +11,7 @@ jobs:
     env:
       MODULE_NAME: PowerShell.MCP
       CONFIGURATION: Release
-      PROGET_URL: https://repo.nerdforge.dev/nuget/PowerShell/
+      PROGET_URL: https://repo.nerdforge.dev/nuget/PowerShell/v3/index.json
 
     steps:
       - uses: actions/checkout@v4
@@ -67,17 +67,24 @@ jobs:
           echo "--- final staging tree ---"
           find "$STAGE" -maxdepth 3 -printf '%P\t%s\n' | sort
 
-      - name: Publish to ProGet
+      - name: Publish to ProGet (NuGet v3 via PSResourceGet)
         shell: pwsh
         env:
           PROGET_API_KEY: ${{ secrets.PROGET_API_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
-          Register-PSRepository -Name ProGet `
-            -SourceLocation $env:PROGET_URL `
-            -PublishLocation $env:PROGET_URL `
-            -InstallationPolicy Trusted
-          Publish-Module -Path "./staging/$env:MODULE_NAME" `
+
+          # PSResourceGet speaks NuGet v3. The older Publish-Module (PowerShellGet
+          # 2.x) only speaks v2, so we use Publish-PSResource instead.
+          Install-Module Microsoft.PowerShell.PSResourceGet -Force -AllowClobber -Scope CurrentUser
+          Import-Module Microsoft.PowerShell.PSResourceGet
+
+          Register-PSResourceRepository -Name ProGet `
+            -Uri $env:PROGET_URL `
+            -Trusted `
+            -Force
+
+          Publish-PSResource -Path "./staging/$env:MODULE_NAME" `
             -Repository ProGet `
-            -NuGetApiKey $env:PROGET_API_KEY `
+            -ApiKey $env:PROGET_API_KEY `
             -Verbose
