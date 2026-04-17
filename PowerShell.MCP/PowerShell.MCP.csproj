@@ -1,0 +1,52 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Version>1.7.6.0</Version>
+    <NoWarn>$(NoWarn);NETSDK1206</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PowerShell.MCP.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Resources\MCPLocationProvider.ps1" />
+    <None Remove="Resources\MCPPollingEngine.ps1" />
+    <None Remove="Resources\MCPCleanup.ps1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\MCPLocationProvider.ps1" />
+    <EmbeddedResource Include="Resources\MCPPollingEngine.ps1" />
+    <EmbeddedResource Include="Resources\MCPCleanup.ps1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
+    <PackageReference Include="System.Management.Automation" Version="7.2.15" />
+    <!-- Ude.NetStandard を出力ディレクトリにコピー -->
+    <PackageReference Include="Ude.NetStandard" Version="1.2.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="System.Formats.Asn1" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageReference Include="System.Formats.Asn1" Version="9.0.9" />
+  </ItemGroup>
+
+  <!-- Ude.NetStandard.dll のみを出力ディレクトリにコピー -->
+  <Target Name="CopyUdeNetStandard" AfterTargets="Build">
+    <ItemGroup>
+      <UdeDll Include="$(NuGetPackageRoot)ude.netstandard\1.2.0\lib\netstandard2.0\Ude.NetStandard.dll" Condition="Exists('$(NuGetPackageRoot)ude.netstandard\1.2.0\lib\netstandard2.0\Ude.NetStandard.dll')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(UdeDll)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" Condition="'@(UdeDll)' != ''" />
+    <Message Text="Copied Ude.NetStandard.dll to output directory" Importance="High" Condition="'@(UdeDll)' != ''" />
+    <Warning Text="Ude.NetStandard.dll not found in NuGet packages!" Condition="'@(UdeDll)' == ''" />
+  </Target>
+
+</Project>

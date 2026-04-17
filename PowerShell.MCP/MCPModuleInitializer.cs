@@ -1,0 +1,265 @@
+using System.Management.Automation;
+using System.Reflection;
+using PowerShell.MCP.Services;
+
+namespace PowerShell.MCP
+{
+    /// <summary>
+    /// Helper class for loading embedded resources from the Resources/ folder
+    /// </summary>
+    public static class EmbeddedResourceLoader
+    {
+        public static string LoadScript(string scriptFileName)
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var assemblyName = assembly.GetName().Name;
+            var resourceName = $"{assemblyName}.Resources.{scriptFileName}";
+
+            using var stream = assembly.GetManifestResourceStream(resourceName) ?? throw new FileNotFoundException($"Embedded resource '{resourceName}' not found.");
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
+        }
+    }
+
+    /// <summary>
+    /// Initialization class for PowerShell.MCP module
+    /// Automatically executed when the module is imported
+    /// </summary>
+    public class MCPModuleInitializer : IModuleAssemblyInitializer
+    {
+        private static readonly object _serverLock = new();
+        private static CancellationTokenSource? _tokenSource;
+        private static NamedPipeServer? _namedPipeServer;
+        public static readonly string ServerVersion = Assembly.GetExecutingAssembly().GetName().Version!.ToString();
+
+        public void OnImport()
+        {
+            try
+            {
+                // Read proxy PID from global variable (set by PowerShell.MCP.Proxy before Import-Module)
+                int? proxyPid = null;
+                using (var ps = System.Management.Automation.PowerShell.Create(RunspaceMode.CurrentRunspace))
+                {
+                    ps.AddScript("$global:PowerShellMCPProxyPid");
+                    var result = ps.Invoke();
+                    if (result.Count > 0 && result[0]?.BaseObject is int pid)
+                    {
+                        proxyPid = pid;
+                    }
+                }
+
+                // Read agent ID from global variable (set by PowerShell.MCP.Proxy before Import-Module)
+                string? agentId = null;
+                using (var ps2 = System.Management.Automation.PowerShell.Create(RunspaceMode.CurrentRunspace))
+                {
+                    ps2.AddScript("$global:PowerShellMCPAgentId");
+                    var agentResult = ps2.Invoke();
+                    if (agentResult.Count > 0 && agentResult[0]?.BaseObject is string aid)
+                    {
+                        agentId = aid;
+                    }
+                }
+
+                lock (_serverLock)
+                {
+                    // Clean up existing server if module is being re-imported (e.g., profile loaded it first)
+                    if (_namedPipeServer != null)
+                    {
+                        try
+                        {
+                            _tokenSource?.Cancel();
+                            _namedPipeServer.Dispose();
+                        }
+                        catch { }
+                        _namedPipeServer = null;
+                        _tokenSource = null;
+                    }
+
+                    // Create Named Pipe server with proxy PID, agent ID (if available), and pwsh PID
+                    _namedPipeServer = new NamedPipeServer(proxyPid, agentId);
+                    _tokenSource = new CancellationTokenSource();
+                }
+
+                // Set initial window title for unowned consoles (Proxy-launched consoles get titled immediately after)
+                if (!proxyPid.HasValue)
+                {
+                    using var psTitle = System.Management.Automation.PowerShell.Create(RunspaceMode.CurrentRunspace);
+                    psTitle.AddScript($"$Host.UI.RawUI.WindowTitle = '#{Environment.ProcessId} ____'");
+                    psTitle.Invoke();
+                }
+
+                // Load and execute MCP polling engine script
+                var pollingScript = EmbeddedResourceLoader.LoadScript("MCPPollingEngine.ps1");
+
+                // Execute as ScriptBlock for PowerShell execution
+                using (var ps = System.Management.Automation.PowerShell.Create(RunspaceMode.CurrentRunspace))
+                {
+                    ps.AddScript(pollingScript);
+                    ps.Invoke();
+                }
+
+                // Start Named Pipe Server
+                CancellationToken token;
+                NamedPipeServer server;
+                lock (_serverLock)
+                {
+                    token = _tokenSource!.Token;
+                    server = _namedPipeServer!;
+                }
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await server.StartAsync(token);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[ERROR] Named Pipe server failed: {ex.Message}");
+                    }
+                }, token);
+            }
+            catch (Exception ex)
+            {
+                // Output warning message for errors
+                using (var ps = System.Management.Automation.PowerShell.Create(RunspaceMode.CurrentRunspace))
+                {
+                    ps.AddScript($"Write-Warning '[PowerShell.MCP] Failed to start: {ex.Message.Replace("'", "''")}'");
+                    ps.Invoke();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets current location and drive information
+        /// </summary>
+        public static string GetCurrentLocation()
+        {
+            try
+            {
+                // Use existing MCPLocationProvider.ps1 script
+                var locationCommand = EmbeddedResourceLoader.LoadScript("MCPLocationProvider.ps1");
+
+                // Execute silently with state management
+                var result = McpServerHost.ExecuteSilentCommand(locationCommand);
+
+                // Replace "Pipeline" with "get_current_location" in status line
+                return result.Replace("Pipeline executed", "get_current_location executed");
+            }
+            catch (Exception ex)
+            {
+                return $"Error getting current location: {ex.Message}";
+            }
+        }
+        /// <summary>
+        /// Claims this console for a specific proxy by restarting the Named Pipe server with new name.
+        /// Called when a proxy connects to an unowned console.
+        /// </summary>
+        /// <param name="proxyPid">The PID of the proxy claiming this console</param>
+        /// <param name="agentId">Agent ID for console isolation</param>
+        /// <returns>The new pipe name after claiming</returns>
+        public static string? ClaimConsole(int proxyPid, string? agentId = null)
+        {
+            lock (_serverLock)
+            {
+                if (_namedPipeServer == null || _tokenSource == null)
+                    return null;
+
+                try
+                {
+                    // Stop current server
+                    _tokenSource.Cancel();
+                    _namedPipeServer.Dispose();
+
+                    // Create new server with proxy PID and agent ID
+                    _namedPipeServer = new NamedPipeServer(proxyPid, agentId);
+                    _tokenSource = new CancellationTokenSource();
+
+                    // Capture for closure
+                    var server = _namedPipeServer;
+                    var token = _tokenSource.Token;
+
+                    // Start new server
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await server.StartAsync(token);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"[ERROR] Named Pipe server failed (ClaimConsole): {ex.Message}");
+                        }
+                    }, token);
+
+                    return _namedPipeServer.PipeName;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ERROR] ClaimConsole failed: {ex.Message}");
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Releases this console from proxy ownership by restarting the Named Pipe server as unowned.
+        /// Called when the owning proxy process is detected as dead.
+        /// </summary>
+        /// <returns>The new unowned pipe name, or null on failure</returns>
+        public static string? ReleaseConsole()
+        {
+            lock (_serverLock)
+            {
+                if (_namedPipeServer == null || _tokenSource == null)
+                    return null;
+
+                try
+                {
+                    // Stop current server
+                    _tokenSource.Cancel();
+                    _namedPipeServer.Dispose();
+
+                    // Create new server without proxy PID (unowned: 2-segment pipe name)
+                    _namedPipeServer = new NamedPipeServer(null);
+                    _tokenSource = new CancellationTokenSource();
+
+                    // Capture for closure
+                    var server = _namedPipeServer;
+                    var token = _tokenSource.Token;
+
+                    // Start new server
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await server.StartAsync(token);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"[ERROR] Named Pipe server failed (ReleaseConsole): {ex.Message}");
+                        }
+                    }, token);
+
+                    return _namedPipeServer.PipeName;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ERROR] ReleaseConsole failed: {ex.Message}");
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the current pipe name for this console.
+        /// </summary>
+        /// <returns>The pipe name, or null if not initialized</returns>
+        public static string? GetPipeName()
+        {
+            lock (_serverLock)
+            {
+                return _namedPipeServer?.PipeName;
+            }
+        }
+    }
+}

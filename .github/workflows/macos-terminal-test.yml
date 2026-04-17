@@ -1,0 +1,197 @@
+name: macOS Terminal E2E Test
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+permissions:
+  contents: read
+
+jobs:
+  test-macos-terminal:
+    runs-on: macos-14
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: |
+          8.0.x
+          9.0.x
+
+    - name: Install PowerShell
+      run: |
+        curl -sSL -o /tmp/powershell.tar.gz https://github.com/PowerShell/PowerShell/releases/download/v7.5.4/powershell-7.5.4-osx-arm64.tar.gz
+        sudo mkdir -p /usr/local/microsoft/powershell/7
+        sudo tar zxf /tmp/powershell.tar.gz -C /usr/local/microsoft/powershell/7
+        sudo chmod +x /usr/local/microsoft/powershell/7/pwsh
+        sudo ln -sf /usr/local/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
+        pwsh --version
+
+    - name: Build and setup module
+      run: |
+        dotnet build PowerShell.MCP -c Release --no-incremental
+        dotnet publish PowerShell.MCP.Proxy -c Release -r osx-arm64 --self-contained
+
+        MODULE_PATH="$HOME/.local/share/powershell/Modules/PowerShell.MCP"
+        mkdir -p "$MODULE_PATH/bin/osx-arm64"
+        cp PowerShell.MCP/bin/Release/net8.0/PowerShell.MCP.dll "$MODULE_PATH/"
+        cp PowerShell.MCP/bin/Release/net8.0/Ude.NetStandard.dll "$MODULE_PATH/"
+        cp Staging/PowerShell.MCP.psd1 "$MODULE_PATH/"
+        cp Staging/PowerShell.MCP.psm1 "$MODULE_PATH/"
+        cp PowerShell.MCP.Proxy/bin/Release/net9.0/osx-arm64/publish/PowerShell.MCP.Proxy "$MODULE_PATH/bin/osx-arm64/"
+        chmod +x "$MODULE_PATH/bin/osx-arm64/PowerShell.MCP.Proxy"
+
+        echo "Module files:"
+        ls -laR "$MODULE_PATH/"
+
+    - name: Launch pwsh in Terminal.app manually (bypass AppleScript TCC)
+      run: |
+        # AppleScript requires TCC approval which can't be granted in CI.
+        # Instead, use 'open' command to launch Terminal.app, then run pwsh via .zshrc trick.
+        # Create a launcher script that Terminal.app will execute on open.
+        MODULE_PATH="$HOME/.local/share/powershell/Modules/PowerShell.MCP"
+        PROXY_PID=$$
+
+        cat > /tmp/launch-pwsh.sh << LAUNCHER
+        #!/bin/zsh
+        export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"
+        exec pwsh -NoExit -Command "\\\$global:PowerShellMCPProxyPid = ${PROXY_PID}; \\\$global:PowerShellMCPAgentId = 'default'; Import-Module PowerShell.MCP -Force; Remove-Module PSReadLine -ErrorAction SilentlyContinue"
+        LAUNCHER
+        chmod +x /tmp/launch-pwsh.sh
+
+        # Open Terminal.app running our script
+        open -a Terminal /tmp/launch-pwsh.sh
+
+        # Wait for Named Pipe to appear
+        echo "Waiting for Named Pipe..."
+        echo "TMPDIR=$TMPDIR"
+        for i in $(seq 1 60); do
+          PIPE=$(find /tmp ${TMPDIR:-/tmp} -name "CoreFxPipe_PSMCP.*" 2>/dev/null | sort -u | head -1)
+          if [ -n "$PIPE" ]; then
+            echo "Named Pipe found: $PIPE (after ${i}s)"
+            break
+          fi
+          sleep 1
+        done
+
+        if [ -z "$PIPE" ]; then
+          echo "ERROR: Named Pipe not found after 60s"
+          screencapture -x /tmp/screenshot-error.png 2>/dev/null
+          exit 1
+        fi
+
+        screencapture -x /tmp/screenshot-after-start.png 2>/dev/null
+        echo "Terminal.app with pwsh is running"
+
+    - name: Test invoke_expression via Named Pipe (Issue #38)
+      shell: pwsh
+      timeout-minutes: 3
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        # Find the Named Pipe (macOS uses $TMPDIR which is /var/folders/.../T/)
+        $searchDirs = @('/tmp')
+        if ($env:TMPDIR -and $env:TMPDIR -ne '/tmp') { $searchDirs += $env:TMPDIR.TrimEnd('/') }
+        Write-Host "Searching for pipes in: $($searchDirs -join ', ')"
+        $pipes = @()
+        foreach ($dir in $searchDirs) {
+          $pipes += Get-ChildItem "$dir/CoreFxPipe_PSMCP.*" -ErrorAction SilentlyContinue
+        }
+        if (-not $pipes) { throw "No Named Pipe found in: $($searchDirs -join ', ')" }
+
+        $pipeName = $pipes[0].Name -replace '^CoreFxPipe_', ''
+        Write-Host "Using pipe: $pipeName"
+
+        # Import module and get version for protocol handshake
+        Import-Module PowerShell.MCP
+        $moduleVersion = [PowerShell.MCP.MCPModuleInitializer]::ServerVersion
+        Write-Host "Module version: $moduleVersion"
+
+        # Helper to send command via Named Pipe (4-byte length-prefixed binary protocol)
+        function Send-PipeCommand {
+          param([string]$Pipeline, [int]$TimeoutSec = 30)
+          $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', $pipeName)
+          $client.Connect($TimeoutSec * 1000)
+
+          $json = @{ name = "invoke_expression"; pipeline = $Pipeline; proxy_version = $moduleVersion } | ConvertTo-Json -Compress
+          $msgBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+          $lenBytes = [BitConverter]::GetBytes([int]$msgBytes.Length)
+
+          # Send: 4-byte length prefix + message body
+          $client.Write($lenBytes, 0, 4)
+          $client.Write($msgBytes, 0, $msgBytes.Length)
+          $client.Flush()
+
+          # Receive: 4-byte length prefix + message body
+          $respLenBytes = [byte[]]::new(4)
+          $client.Read($respLenBytes, 0, 4) | Out-Null
+          $respLen = [BitConverter]::ToInt32($respLenBytes, 0)
+          $respBytes = [byte[]]::new($respLen)
+          $totalRead = 0
+          while ($totalRead -lt $respLen) {
+            $read = $client.Read($respBytes, $totalRead, $respLen - $totalRead)
+            if ($read -eq 0) { break }
+            $totalRead += $read
+          }
+          $client.Dispose()
+          return [System.Text.Encoding]::UTF8.GetString($respBytes, 0, $totalRead)
+        }
+
+        # Test 1: Quick command
+        Write-Host "`n=== Test 1: Quick command ===" -ForegroundColor Cyan
+        $response = Send-PipeCommand "Write-Host TEST-QUICK -ForegroundColor Green"
+        Write-Host "Response: $($response.Substring(0, [Math]::Min(300, $response.Length)))..."
+        if ($response -match 'TEST-QUICK') {
+          Write-Host "PASS: Quick command executed" -ForegroundColor Green
+        } else {
+          throw "Quick command failed"
+        }
+
+        # Test 2: Delayed command (main #38 scenario)
+        Write-Host "`n=== Test 2: Command after 5s delay ===" -ForegroundColor Cyan
+        Start-Sleep -Seconds 5
+        $response = Send-PipeCommand "Get-Date -Format yyyy-MM-dd"
+        Write-Host "Response: $response"
+        $today = Get-Date -Format "yyyy-MM-dd"
+        if ($response -match $today) {
+          Write-Host "PASS: Delayed command returned correct date" -ForegroundColor Green
+        } else {
+          throw "Issue #38 regression: delayed command did not execute"
+        }
+
+        # Test 3: Long-running command
+        Write-Host "`n=== Test 3: Long-running command (3s) ===" -ForegroundColor Cyan
+        $response = Send-PipeCommand "Start-Sleep -Seconds 3; Write-Host LONG-DONE" 60
+        Write-Host "Response: $($response.Substring(0, [Math]::Min(300, $response.Length)))..."
+        if ($response -match 'LONG-DONE') {
+          Write-Host "PASS: Long-running command completed" -ForegroundColor Green
+        } else {
+          throw "Long-running command failed"
+        }
+
+        # Test 4: Command immediately after long-running
+        Write-Host "`n=== Test 4: Command after long-running ===" -ForegroundColor Cyan
+        $response = Send-PipeCommand "Write-Host AFTER-LONG"
+        Write-Host "Response: $($response.Substring(0, [Math]::Min(300, $response.Length)))..."
+        if ($response -match 'AFTER-LONG') {
+          Write-Host "PASS: Post-long command executed" -ForegroundColor Green
+        } else {
+          throw "Post-long command failed"
+        }
+
+        screencapture -x /tmp/screenshot-final.png 2>$null
+
+        Write-Host "`n========================================" -ForegroundColor Green
+        Write-Host "ALL TESTS PASSED - Issue #38 not reproduced" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
+
+    - name: Upload screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-terminal-screenshots
+        path: /tmp/screenshot-*.png
+        if-no-files-found: ignore
