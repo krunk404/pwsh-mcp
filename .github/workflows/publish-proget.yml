@@ -1,0 +1,83 @@
+name: Publish module to ProGet
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      MODULE_NAME: PowerShell.MCP
+      CONFIGURATION: Release
+      PROGET_URL: https://repo.nerdforge.dev/nuget/PowerShell/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Restore
+        run: |
+          dotnet restore PowerShell.MCP/PowerShell.MCP.csproj
+          dotnet restore PowerShell.MCP.Proxy/PowerShell.MCP.Proxy.csproj
+
+      - name: Build module DLL (net8.0)
+        run: >
+          dotnet build PowerShell.MCP/PowerShell.MCP.csproj
+          -c $CONFIGURATION
+          -f net8.0
+          --no-restore
+
+      - name: Publish proxy for each RID
+        run: |
+          set -euo pipefail
+          for rid in win-x64 linux-x64 osx-x64 osx-arm64; do
+            echo "::group::publish $rid"
+            dotnet publish PowerShell.MCP.Proxy/PowerShell.MCP.Proxy.csproj \
+              -c "$CONFIGURATION" \
+              -r "$rid" \
+              -o "staging/$MODULE_NAME/bin/$rid" \
+              --self-contained \
+              --no-restore
+            echo "::endgroup::"
+          done
+
+      - name: Assemble module staging directory
+        run: |
+          set -euo pipefail
+          STAGE="staging/$MODULE_NAME"
+          BUILD_OUT="PowerShell.MCP/bin/$CONFIGURATION/net8.0"
+
+          cp Staging/PowerShell.MCP.psd1 "$STAGE/"
+          cp Staging/PowerShell.MCP.psm1 "$STAGE/"
+          cp "$BUILD_OUT/PowerShell.MCP.dll" "$STAGE/"
+          cp "$BUILD_OUT/Ude.NetStandard.dll" "$STAGE/"
+
+          if ls "$BUILD_OUT/en-US/"*.xml >/dev/null 2>&1; then
+            mkdir -p "$STAGE/en-US"
+            cp "$BUILD_OUT/en-US/"*.xml "$STAGE/en-US/"
+          fi
+
+          echo "--- final staging tree ---"
+          find "$STAGE" -maxdepth 3 -printf '%P\t%s\n' | sort
+
+      - name: Publish to ProGet
+        shell: pwsh
+        env:
+          PROGET_API_KEY: ${{ secrets.PROGET_API_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Register-PSRepository -Name ProGet `
+            -SourceLocation $env:PROGET_URL `
+            -PublishLocation $env:PROGET_URL `
+            -InstallationPolicy Trusted
+          Publish-Module -Path "./staging/$env:MODULE_NAME" `
+            -Repository ProGet `
+            -NuGetApiKey $env:PROGET_API_KEY `
+            -Verbose
