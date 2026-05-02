@@ -360,6 +360,16 @@ function Get-MCPProxyPath {
         throw "PowerShell.MCP.Proxy not found at: $proxyPath. Please ensure the module is properly installed for your platform ($rid)."
     }
 
+    # NuGet's zip implementation drops Unix mode bits, so packages installed via
+    # PSResourceGet land with the executable bit cleared. Repair on first lookup
+    # so callers (Register-PwshToClaudeDesktop, etc.) don't have to know about it.
+    if (-not $IsWindows) {
+        $info = Get-Item -LiteralPath $proxyPath
+        if (-not ($info.UnixMode -match 'x')) {
+            & chmod +x $proxyPath
+        }
+    }
+
     if ($Escape) {
         return $proxyPath.Replace('\', '\\')
     }

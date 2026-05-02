@@ -42,10 +42,14 @@ public static class LauncherRegistry
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            // Opt-in launcher first so PWSH_MCP_LAUNCHER=termius can pick it.
-            // PwshLauncherMacOS is the default fallback (always available).
-            yield return new PwshLauncherTermius();
+            // PwshLauncherMacOS is the default — Terminal.app always works, so
+            // it must come first in the list. The default-fallback path picks
+            // the first IsAvailable() candidate, and Termius's IsAvailable()
+            // returns true whenever /Applications/Termius.app exists; if
+            // Termius came first, just *installing* Termius would silently
+            // change the launcher. Termius is opt-in, gated on the env var.
             yield return new PwshLauncherMacOS();
+            yield return new PwshLauncherTermius();
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
