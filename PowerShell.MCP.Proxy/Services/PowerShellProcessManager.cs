@@ -66,22 +66,10 @@ public class PowerShellProcessManager
             existingPipes = sessionManager.EnumeratePipes(sessionManager.ProxyPid, agentId).ToHashSet();
         }
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            pid = PwshLauncherWindows.LaunchPwsh(agentId, startupCommands, startLocation);
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            PwshLauncherMacOS.LaunchPwsh(agentId, startupCommands, startLocation);
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-        {
-            PwshLauncherLinux.LaunchPwsh(agentId, startupCommands, startLocation);
-        }
-        else
-        {
-            throw new PlatformNotSupportedException("Unsupported operating system");
-        }
+        var launcher = LauncherRegistry.Resolve();
+        Console.Error.WriteLine($"[INFO] PowerShellProcessManager: using launcher '{launcher.Name}'");
+        var maybePid = await launcher.LaunchPwshAsync(agentId, startupCommands, startLocation);
+        pid = maybePid ?? 0;
 
         // Wait for Named Pipe to be ready
         string? pipeName;
@@ -182,8 +170,13 @@ public class PowerShellProcessManager
 /// <summary>
 /// Windows-specific launcher using Win32 API to create a new console window
 /// </summary>
-public static class PwshLauncherWindows
+public class PwshLauncherWindows : IPwshLauncher
 {
+    public string Name => "windows";
+    public bool IsAvailable() => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+    public Task<int?> LaunchPwshAsync(string agentId, string? startupCommands, string? startLocation)
+        => Task.FromResult<int?>(LaunchPwsh(agentId, startupCommands, startLocation));
+
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
 
@@ -239,7 +232,7 @@ public static class PwshLauncherWindows
     private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
     private const uint CREATE_NEW_CONSOLE = 0x00000010;
 
-    public static int LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
+    public int LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
     {
         IntPtr hToken = IntPtr.Zero;
         IntPtr env = IntPtr.Zero;
@@ -316,9 +309,17 @@ public static class PwshLauncherWindows
 /// <summary>
 /// macOS-specific launcher using AppleScript to open Terminal.app
 /// </summary>
-public static class PwshLauncherMacOS
+public class PwshLauncherMacOS : IPwshLauncher
 {
-    public static void LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
+    public string Name => "macos";
+    public bool IsAvailable() => RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+    public Task<int?> LaunchPwshAsync(string agentId, string? startupCommands, string? startLocation)
+    {
+        LaunchPwsh(agentId, startupCommands, startLocation);
+        return Task.FromResult<int?>(null);
+    }
+
+    public void LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -371,8 +372,16 @@ public static class PwshLauncherMacOS
 /// <summary>
 /// Linux-specific launcher that tries multiple terminal emulators
 /// </summary>
-public static class PwshLauncherLinux
+public class PwshLauncherLinux : IPwshLauncher
 {
+    public string Name => "linux";
+    public bool IsAvailable() => RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+    public Task<int?> LaunchPwshAsync(string agentId, string? startupCommands, string? startLocation)
+    {
+        LaunchPwsh(agentId, startupCommands, startLocation);
+        return Task.FromResult<int?>(null);
+    }
+
     // Terminal emulator configurations: (name, useShellWrapper, args...)
     // useShellWrapper: true = use "sh -c" to wrap the command (for terminals that need a single command string)
     private static readonly string[] SupportedTerminals =
@@ -389,7 +398,7 @@ public static class PwshLauncherLinux
         "kitty",
     ];
 
-    public static void LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
+    public void LaunchPwsh(string agentId, string? startupCommands = null, string? startLocation = null)
     {
         foreach (var terminal in SupportedTerminals)
         {
