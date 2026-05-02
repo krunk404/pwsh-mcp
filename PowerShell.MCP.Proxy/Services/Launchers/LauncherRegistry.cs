@@ -44,12 +44,13 @@ public static class LauncherRegistry
         {
             // PwshLauncherMacOS is the default — Terminal.app always works, so
             // it must come first in the list. The default-fallback path picks
-            // the first IsAvailable() candidate, and Termius's IsAvailable()
-            // returns true whenever /Applications/Termius.app exists; if
-            // Termius came first, just *installing* Termius would silently
-            // change the launcher. Termius is opt-in, gated on the env var.
+            // the first IsAvailable() candidate, so any opt-in launcher whose
+            // IsAvailable() returns true based purely on app presence (e.g.
+            // Ghostty.app exists) MUST come after MacOS to avoid silently
+            // changing the default launcher when the user just installs the
+            // alternate app. Opt-in launchers are gated on the env var.
             yield return new PwshLauncherMacOS();
-            yield return new PwshLauncherTermius();
+            yield return new PwshLauncherGhostty();
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
